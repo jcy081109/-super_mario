@@ -1,10 +1,10 @@
-﻿# Super Mario Keyboard Play
+# Super Mario Keyboard Play
 
 这是一个基于 `gym_super_mario_bros` 的可操作版超级马里奥游戏。
 
 ## 1. 创建 Conda 环境
 
-在 PowerShell 中进入项目目录：
+进入项目目录：
 
 ```powershell
 cd C:\Users\16937\Desktop\super_mario
