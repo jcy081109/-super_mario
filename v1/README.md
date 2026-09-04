@@ -105,6 +105,18 @@ python -m mario_rl.train --render
 
 # 渲染频率控制（每N步渲染一帧，默认4；越小越流畅但越慢）
 python -m mario_rl.train --render --render-freq 8
+
+# 多关卡训练（默认：全部8章，每章前三关训练，最后一关测试取平均）
+python -m mario_rl.train --adaptive-entropy --lr-schedule linear --n-envs 8 --total-timesteps 3000000
+
+# 指定训练章节（如只练前4章：12训练关+4测试关）
+python -m mario_rl.train --worlds 1,2,3,4 --total-timesteps 2000000
+
+# 自定义训练关卡列表 + 单个测试关
+python -m mario_rl.train --train-levels "1-1,1-2,2-1,2-2" --eval-level "3-1" --total-timesteps 1000000
+
+# 多进程真并行（SubprocVecEnv，CPU环境模拟真正并行，8环境速度提升30-50%）
+python -m mario_rl.train --vec-env-type subproc --n-envs 8 --total-timesteps 2000000
 ```
 
 模型 checkpoint 保存在 `checkpoints/`，TensorBoard 日志在 `logs/`。
@@ -117,6 +129,45 @@ python -m mario_rl.train --render --render-freq 8
 - `best/best_model.zip`：EvalCallback 保存的最佳模型
 
 > **实时渲染说明**：`--render` 开启后训练时会弹出游戏窗口，显示第一个环境的实时画面。渲染会拖慢训练速度（fps 下降约 30-50%），建议先不开渲染训练，想看效果时用 `watch` 或 `evaluate --render`。渲染窗口需要桌面环境，无头服务器无法使用。
+
+### 多关卡训练模式（默认开启）
+
+默认采用**训练集/测试集分离**模式，强制模型学通用策略而非记忆单关布局：
+
+| 集合 | 关卡 | 数量（默认8章） |
+|---|---|---|
+| 训练集 | 每章 stage 1-3 | 24关 |
+| 测试集 | 每章 stage 4（Boss关） | 8关 |
+
+- 训练时每次 reset 从训练集随机选关
+- 评估时每次 reset 从测试集随机选关，EvalCallback 评估 N 局取平均 = 所有测试关平均
+- `eval/mean_reward` 就是泛化能力指标，与 `rollout/ep_rew_mean`（训练集性能）对比可判断过拟合
+
+**常用命令**：
+```bash
+# 默认全部8章（24训练+8测试）
+python -m mario_rl.train --total-timesteps 3000000
+
+# 只练前4章（12训练+4测试）
+python -m mario_rl.train --worlds 1,2,3,4 --total-timesteps 2000000
+
+# 自定义训练关卡 + 单个测试关
+python -m mario_rl.train --train-levels "1-1,1-2,2-1" --eval-level "3-1"
+```
+
+### 多进程真并行（--vec-env-type subproc）
+
+默认 `DummyVecEnv` 是单进程串行（所有环境在一个进程里依次 step，只有 GPU 推理是批量的）。`SubprocVecEnv` 每个环境独立进程，CPU 环境模拟可真正并行：
+
+| | DummyVecEnv（默认） | SubprocVecEnv |
+|---|---|---|
+| CPU 环境模拟 | 串行 | 真正并行 |
+| 启动速度 | 快 | 慢（5-10秒） |
+| 内存占用 | 低 | 高（3-4倍） |
+| 8环境预期 fps | ~170 | ~220-250 |
+| 稳定性 | 高 | 中 |
+
+> **注意**：SubprocVecEnv 训练时不要加 `--render`，子进程渲染会有问题。
 
 ### 训练进度与指标
 
@@ -210,11 +261,15 @@ python -m mario_rl.watch --no-auto-reload
 
 # 使用确定性策略（默认随机策略，每局不同；想看最优/最稳定表现加这个）
 python -m mario_rl.watch --deterministic
+
+# 看模型在特定关卡的表现（如 2-4 Boss关，测试泛化能力）
+python -m mario_rl.watch --world 2 --stage 4
 ```
 
 **watch 模式说明**：
 - 默认使用**随机策略**（从策略分布中采样），每局表现不同，能看到模型的真实能力范围
 - 加 `--deterministic` 使用贪心策略（选概率最高的动作），每局表现相同，适合看最优表现
+- `--world --stage` 指定关卡（默认1-1），可用来测试模型在未训练关卡上的泛化能力
 - 自动刷新按**文件修改时间**查找最新模型，不是按步数
 - 训练时 `CheckpointCallback` 每 5 万步保存新模型，watch 每局结束后自动检测并加载
 
@@ -279,7 +334,7 @@ python -m pytest mario_rl/tests/ -v
 - [x] 阶段一：需求分析与技术选型 → `docs/phase1-requirements-and-selection.md`
 - [x] 阶段二：环境搭建 → `requirements.txt` + `verify_env.py`
 - [x] 阶段三：结构化设计 → `DESIGN.md` + 完整代码骨架
-- [x] 阶段四：迭代开发（4/8环境+奖励归一化+实时渲染+跳跃惩罚+x_pos指标+微调+学习率调度+自适应熵，500万步通关率90%/评估100%）
+- [x] 阶段四：迭代开发（4/8环境+奖励归一化+实时渲染+跳跃惩罚+x_pos指标+微调+学习率调度+自适应熵+多关卡训练集测试集分离+SubprocVecEnv真并行，500万步单关通关率90%/评估100%）
 - [ ] 阶段五：集成测试与优化
 - [ ] 阶段六：打包部署与文档
 - [ ] 阶段七：持续维护与迭代
@@ -299,6 +354,8 @@ python -m pytest mario_rl/tests/ -v
 | clip_fraction | 0 |
 | 训练速度 | ~170 fps（8环境，RTX 5060） |
 | 训练时长 | 约 8 小时（480分钟） |
+
+> **注**：以上为单关卡（1-1）训练成果。当前默认已切换为**多关卡训练集/测试集分离模式**（每章前三关训练，最后一关测试取平均），用于提升泛化能力。多关卡训练成果待补充。
 
 ### 训练曲线（TensorBoard，PPO_23，500万步）
 

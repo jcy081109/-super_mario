@@ -58,6 +58,8 @@ mario-rl/
 
 6. **VecNormalize 只归一化奖励**：`norm_obs=False`（观测已在 Wrapper 中归一化到 [0,1]，避免重复归一化），`norm_reward=True`（解决马里奥奖励尺度过大导致值函数学不会、策略不更新的问题）。VecNormalize 只在训练时包装，评估/推理时不需要。
 
+7. **RandomLevelEnv 多关卡随机**：继承 `gym.Wrapper`，每次 `reset()` 随机选一个关卡并重建底层环境。支持 `levels` 参数直接指定关卡列表（优先级高于 worlds/stages 笛卡尔积）。用于多关卡训练集/测试集分离模式，强制模型学通用策略而非记忆单关布局。注意：每次 reset 会销毁旧环境创建新环境，有一定开销，但相比游戏步数可忽略。
+
 ## 3. 训练架构
 
 ### 多环境并行
@@ -66,6 +68,42 @@ mario-rl/
 - 4 个观测拼成 batch 一次性喂给 GPU，GPU 利用率从 ~15% 提升到 ~50%+
 - fps 从单环境 ~81 提升到 4 环境 ~150+
 - n_steps=1024 是每环境步数，每轮实际收集 1024×4=4096 步
+
+### 多进程真并行（SubprocVecEnv）
+
+默认 `DummyVecEnv` 是单进程串行（所有环境在一个进程里依次 step，只有 GPU 推理是批量的）。`SubprocVecEnv` 每个环境独立进程，CPU 环境模拟可真正并行。
+
+| | DummyVecEnv（默认） | SubprocVecEnv |
+|---|---|---|
+| CPU 环境模拟 | 串行 | 真正并行 |
+| 启动速度 | 快 | 慢（5-10秒） |
+| 内存占用 | 低 | 高（3-4倍） |
+| 8环境预期 fps | ~170 | ~220-250 |
+
+**关键技术**：Windows 上 `SubprocVecEnv` 需要可序列化的工厂类（不能用 lambda）。实现了模块级 `EnvFactory` 类，包含所有环境参数，`__call__` 方法创建环境。
+
+**限制**：SubprocVecEnv 训练时不要加 `--render`，子进程渲染会有问题。
+
+### 多关卡训练集/测试集分离
+
+**问题**：单关卡训练的模型严重过拟合关卡布局，去其他关卡"很近就死"。模型记住的是"在什么时候做什么事"，而不是"遇到什么情况该做什么"。
+
+**解决**：默认采用训练集/测试集分离模式：
+- 训练集：每章 stage 1-3（默认全部8章，共24关）
+- 测试集：每章 stage 4（Boss关，默认8关）
+- 训练时每次 reset 从训练集随机选关（`RandomLevelEnv`）
+- 评估时每次 reset 从测试集随机选关，EvalCallback 评估 N 局取平均 = 所有测试关平均
+
+**泛化能力判断**：
+- `rollout/ep_rew_mean`：训练集性能
+- `eval/mean_reward`：测试集性能（泛化能力）
+- 两者差距越小，泛化能力越强
+- 训练关高但测试关低 = 过拟合
+
+**参数**：
+- `--worlds`：指定参与的 world 列表，默认全部8章
+- `--train-levels`：高级选项，直接指定训练关卡列表
+- `--eval-level`：高级选项，指定单个测试关卡
 
 ### 奖励归一化（VecNormalize）
 
@@ -268,6 +306,8 @@ VecNormalize 在塑形奖励基础上再做 running mean/std 归一化，确保�
 | 19 | 微调时只查找 vecnormalize.pkl，不识别带步数的配对 pkl | CheckpointCallback 保存的 pkl 文件名是 {prefix}_vecnormalize_{steps}_steps.pkl，不是固定的 vecnormalize.pkl | 用正则从模型文件名提取步数，自动构造配对 pkl 文件名查找，找不到再回退到 vecnormalize.pkl |
 | 20 | 微调时报 NameError: name 'Path' is not defined | train.py 使用了 Path 但未导入 | 加 from pathlib import Path |
 | 21 | 自适应熵 Callback 无法实例化（TypeError: Can't instantiate abstract class） | SB3 BaseCallback 是抽象基类，要求子类必须实现 _on_step 方法，AdaptiveEntropyCallback 只实现了 _on_rollout_end | 加 def _on_step(self) -> bool: return True |
+| 22 | Windows SubprocVecEnv 启动失败（pickle 错误） | Windows 上 SubprocVecEnv 需要可序列化的工厂函数，lambda 无法被 pickle | 实现模块级 EnvFactory 类（包含所有环境参数，__call__ 方法创建环境），代替 lambda |
+| 23 | 单关卡训练模型去其他关卡"很近就死" | 模型过拟合单关布局，记住的是"在什么时候做什么事"而非"遇到什么情况该做什么"，泛化能力差 | 多关卡训练集/测试集分离：每章前三关训练，最后一关测试取平均，强制模型学通用策略 |
 
 ## 9. 验证结果
 
@@ -307,3 +347,7 @@ VecNormalize 在塑形奖励基础上再做 running mean/std 归一化，确保�
   - 训练时长：约 8 小时（480分钟）
   - 训练配置：--adaptive-entropy --lr-schedule linear --n-envs 8 --total-timesteps 5000000
 - **8环境并行性能发现**：8环境相比4环境速度提升仅10-30%（不会翻倍），原因：①DummyVecEnv是串行执行环境step，不是真正并行；②GPU推理可能已饱和；③更大batch增加CPU-GPU数据传输开销
+- **SubprocVecEnv真并行验证**：4进程SubprocVecEnv创建、reset、step全部正常。Windows上必须用可序列化的EnvFactory类（不能用lambda）。预期8环境fps从~170提升到~220-250，启动慢5-10秒，内存占用3-4倍
+- **多关卡随机训练验证**：RandomLevelEnv每次reset随机选关，5次reset随机切换1-4/1-1/1-3等，环境创建、step、done全部正常
+- **训练集/测试集分离验证**：默认模式（worlds=1-8）训练集24关（每章stage1-3）、测试集8关（每章stage4）。训练环境15次reset出现的关卡全部属于训练集，评估环境15次reset出现的关卡全部属于测试集。评估时每局随机选测试关，EvalCallback取平均=所有测试关平均
+- **watch指定关卡验证**：--world --stage 参数正常，可看模型在特定关卡（如2-4 Boss关）的表现，用于测试泛化能力

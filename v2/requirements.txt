@@ -1,0 +1,25 @@
+# Mario RL v2 - 流水线 PPO 依赖
+# Python 3.10+
+
+# 深度学习
+torch==2.11.0+cu128
+
+# 强化学习环境
+gym==0.21.0
+gym-super-mario-bros==7.4.0
+nes-py==8.2.1
+
+# 向量化环境（仅用 VecEnv，不用其 PPO 算法）
+stable-baselines3==1.8.0
+
+# 数值计算
+numpy==1.26.4
+opencv-python==4.10.0.84
+
+# 日志
+tensorboard==2.16.2
+
+# 构建工具（gym 0.21 需要）
+pip==23.3.2
+setuptools==65.7.0
+wheel==0.41.2

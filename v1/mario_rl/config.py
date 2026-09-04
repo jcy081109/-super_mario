@@ -23,7 +23,7 @@ class PPOConfig:
     learning_rate: float = 3e-4
     n_steps: int = 1024           # 每次更新收集的步数；笔记本可降为 512
     batch_size: int = 64
-    n_epochs: int = 4
+    n_epochs: int = 8
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
@@ -48,10 +48,10 @@ class ModelConfig:
 class TrainConfig:
     """训练配置"""
     total_timesteps: int = 1_000_000   # 总训练步数（先 100 万看效果）
-    save_freq: int = 50_000             # 每 N 步保存 checkpoint
+    save_freq: int = 200_000             # 每 N 步保存 checkpoint
     log_interval: int = 10              # 每 N 次更新打印日志
-    eval_freq: int = 100_000            # 每 N 步评估一次
-    eval_episodes: int = 5
+    eval_freq: int = 200_000            # 每 N 步评估一次
+    eval_episodes: int = 8
 
 
 @dataclass

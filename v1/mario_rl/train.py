@@ -26,6 +26,37 @@ from .model import get_policy_kwargs
 from .utils import get_device, set_seed
 
 
+class EnvFactory:
+    """可序列化的环境工厂类，用于 SubprocVecEnv 多进程真并行。
+
+    Windows 上 pickle 无法序列化 lambda/局部函数，因此用模块级类代替。
+    每个子进程调用 __call__() 创建独立环境实例。
+    """
+
+    def __init__(self, seed, shaping, time_penalty, jump_penalty,
+                 multi_level, multi_worlds, multi_stages, levels=None):
+        self.seed = seed
+        self.shaping = shaping
+        self.time_penalty = time_penalty
+        self.jump_penalty = jump_penalty
+        self.multi_level = multi_level
+        self.multi_worlds = multi_worlds
+        self.multi_stages = multi_stages
+        self.levels = levels
+
+    def __call__(self):
+        return make_env(
+            seed=self.seed,
+            shaping=self.shaping,
+            time_penalty=self.time_penalty,
+            jump_penalty=self.jump_penalty,
+            multi_level=self.multi_level,
+            multi_worlds=self.multi_worlds,
+            multi_stages=self.multi_stages,
+            levels=self.levels,
+        )
+
+
 class RenderCallback(BaseCallback):
     """训练过程中定期渲染游戏画面（弹窗显示当前第一个环境的游戏画面）。
 
@@ -89,6 +120,31 @@ class AdaptiveEntropyCallback(BaseCallback):
             if self.verbose > 0:
                 direction = "↑ 升高（防坍缩）" if new_ent_coef > current_ent_coef else "↓ 降低（促收敛）"
                 print(f"[自适应熵] entropy={entropy:.3f}, ent_coef: {current_ent_coef:.4f} → {new_ent_coef:.4f} {direction}")
+
+
+class TaggedCheckpointCallback(CheckpointCallback):
+    """CheckpointCallback 子类，保存时打印醒目标签。"""
+    def _on_step(self) -> bool:
+        if self.n_calls % self.save_freq == 0:
+            print(f"\n{'─'*60}")
+            print(f"[保存] 第 {self.num_timesteps:,} 步，保存 checkpoint...")
+        result = super()._on_step()
+        if self.n_calls % self.save_freq == 0:
+            print(f"{'─'*60}\n")
+        return result
+
+
+class TaggedEvalCallback(EvalCallback):
+    """EvalCallback 子类，评估前后打印醒目标签。"""
+    def _on_step(self) -> bool:
+        if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
+            print(f"\n{'═'*60}")
+            print(f"[评估] 第 {self.num_timesteps:,} 步，评估 {self.n_eval_episodes} 局（测试关泛化能力）...")
+            print(f"{'═'*60}")
+        result = super()._on_step()
+        if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
+            print(f"{'═'*60}\n")
+        return result
 
 
 class ProgressCallback(BaseCallback):
@@ -169,12 +225,22 @@ class ProgressCallback(BaseCallback):
             else:
                 reward_str = "暂无完整episode"
 
+            # 从 logger 读取最近一次 PPO 更新的训练指标（熵、KL、值函数质量）
+            train_metrics = ""
+            nv = getattr(self.logger, "name_to_value", {})
+            if nv:
+                entropy = -nv.get("train/entropy_loss", 0)  # entropy_loss 是负数
+                approx_kl = nv.get("train/approx_kl", 0)
+                exp_var = nv.get("train/explained_variance", 0)
+                if entropy > 0:
+                    train_metrics = f" | 熵: {entropy:.2f}, KL: {approx_kl:.4f}, V质量: {exp_var:.2f}"
+
             percent = steps_done / self.total_timesteps * 100
 
             print(
                 f"[进度] {steps_done:>8,}/{self.total_timesteps:,} ({percent:5.1f}%) | "
                 f"已用: {elapsed / 60:5.1f}min | 剩余: {eta_str:>6} | "
-                f"fps: {recent_fps:4.0f} | {reward_str}",
+                f"fps: {recent_fps:4.0f} | {reward_str}{train_metrics}",
                 flush=True,
             )
 
@@ -218,6 +284,22 @@ def parse_args():
                         help="自适应熵的目标熵值（默认1.0，7动作均匀分布熵=1.95）")
     parser.add_argument("--entropy-band", type=float, default=0.3,
                         help="自适应熵的允许波动范围（默认0.3，即目标±0.3）")
+    parser.add_argument("--worlds", type=str, default="1,2,3,4,5,6,7,8",
+                        help="参与训练的 world 列表，逗号分隔（默认全部8章'1,2,3,4,5,6,7,8'）。默认模式：每章前三关(stage1-3)训练，最后一关(stage4)测试，测试结果取平均")
+    parser.add_argument("--multi-level", action="store_true",
+                        help="开启多关卡随机训练：每次 reset 随机选关卡，强制模型学通用策略，提升泛化能力")
+    parser.add_argument("--multi-worlds", type=str, default="1",
+                        help="多关卡训练的 world 范围，逗号分隔（默认'1'，即只在 world 1；'1,2'表示 world 1和2）")
+    parser.add_argument("--multi-stages", type=str, default="1,2,3,4",
+                        help="多关卡训练的 stage 范围，逗号分隔（默认'1,2,3,4'，即1-1到1-4）")
+    parser.add_argument("--vec-env-type", type=str, default="dummy", choices=["dummy", "subproc"],
+                        help="并行环境类型：dummy=单进程串行（默认，稳定），subproc=多进程真并行（Windows上启动慢但CPU环境模拟可真正并行）")
+    parser.add_argument("--train-levels", type=str, default=None,
+                        help="高级：直接指定训练关卡列表，如 '1-1,1-2,2-1'（覆盖--worlds默认模式）")
+    parser.add_argument("--eval-level", type=str, default=None,
+                        help="高级：直接指定单个测试关卡，如 '2-4'（覆盖--worlds默认模式，默认多测试关取平均）")
+    parser.add_argument("--log-interval", type=int, default=10,
+                        help="SB3 详细日志打印频率（每N次PPO更新打印一次，默认10。8环境下约8万步一次，进度条已含关键指标）")
     return parser.parse_args()
 
 
@@ -249,16 +331,55 @@ def main():
     print(f"奖励归一化: {'关闭' if args.no_norm_reward else '开启（VecNormalize，仅奖励）'}")
     print(f"实时渲染: {'开启（每%d步一帧）' % args.render_freq if args.render else '关闭'}")
 
+    # 解析关卡配置：默认模式=每章前三关(stage1-3)训练，最后一关(stage4)测试取平均
+    worlds_list = tuple(int(x) for x in args.worlds.split(","))
+
+    # 训练关卡：--train-levels 优先，否则用所有 world 的 stage 1-3
+    if args.train_levels:
+        train_levels = tuple(
+            tuple(int(x) for x in lv.strip().split("-"))
+            for lv in args.train_levels.split(",")
+        )
+    else:
+        train_levels = tuple((w, s) for w in worlds_list for s in (1, 2, 3))
+    args.multi_level = True  # 训练始终用多关卡随机模式
+    multi_worlds = (1,)
+    multi_stages = (1, 2, 3, 4)
+    print(f"训练关卡: {len(train_levels)}关 → {', '.join(f'{w}-{s}' for w, s in train_levels)}")
+
+    # 测试关卡：--eval-level 优先（单关），否则用所有 world 的 stage 4（多关取平均）
+    eval_levels = None
+    eval_world, eval_stage = None, None
+    if args.eval_level:
+        eval_world, eval_stage = (int(x) for x in args.eval_level.strip().split("-"))
+        print(f"测试关卡: {eval_world}-{eval_stage}（单关评估）")
+    else:
+        eval_levels = tuple((w, 4) for w in worlds_list)
+        print(f"测试关卡: {len(eval_levels)}关 → {', '.join(f'{w}-4' for w in worlds_list)}（每局随机选关，结果取平均）")
+
     # 1. 创建训练环境（多环境并行，每个环境不同种子增加多样性）
-    def make_train_env(rank: int):
-        return lambda: make_env(
-            seed=args.seed + rank,
+    env_factories = [
+        EnvFactory(
+            seed=args.seed + i,
             shaping=args.shaping,
             time_penalty=args.time_penalty,
             jump_penalty=args.jump_penalty,
+            multi_level=True,
+            multi_worlds=multi_worlds,
+            multi_stages=multi_stages,
+            levels=train_levels,
         )
+        for i in range(args.n_envs)
+    ]
 
-    env = DummyVecEnv([make_train_env(i) for i in range(args.n_envs)])
+    if args.vec_env_type == "subproc":
+        from stable_baselines3.common.vec_env import SubprocVecEnv
+        print(f"并行环境类型: SubprocVecEnv（多进程真并行，{args.n_envs}个进程，启动较慢）")
+        env = SubprocVecEnv(env_factories)
+    else:
+        print(f"并行环境类型: DummyVecEnv（单进程串行，{args.n_envs}个环境）")
+        env = DummyVecEnv(env_factories)
+
     print(f"观测空间: {env.observation_space.shape}")
     print(f"动作空间: {env.action_space.n} 个动作")
 
@@ -300,12 +421,25 @@ def main():
     #    评估环境也必须用 VecNormalize 包装，否则 EvalCallback 的 sync_envs_normalization
     #    会因训练/评估环境包装结构不一致而报错（AssertionError）
     #    评估时设置 norm_reward=False（看原始奖励）和 training=False（不更新统计信息）
-    eval_env = DummyVecEnv([lambda: make_env(
-        seed=args.seed + 100,
-        shaping=args.shaping,
-        time_penalty=args.time_penalty,
-        jump_penalty=args.jump_penalty,
-    )])
+    #    多测试关模式：每次 reset 随机选测试关，EvalCallback 评估N局取平均=所有测试关平均
+    if eval_levels is not None:
+        eval_env = DummyVecEnv([lambda: make_env(
+            seed=args.seed + 100,
+            shaping=args.shaping,
+            time_penalty=args.time_penalty,
+            jump_penalty=args.jump_penalty,
+            multi_level=True,
+            levels=eval_levels,
+        )])
+    else:
+        eval_env = DummyVecEnv([lambda: make_env(
+            seed=args.seed + 100,
+            shaping=args.shaping,
+            time_penalty=args.time_penalty,
+            jump_penalty=args.jump_penalty,
+            world=eval_world,
+            stage=eval_stage,
+        )])
     if not args.no_norm_reward:
         eval_env = VecNormalize(eval_env, norm_obs=False, norm_reward=False, training=False)
         print("评估环境已用 VecNormalize 包装（仅结构对齐，不归一化奖励，不更新统计）")
@@ -365,7 +499,7 @@ def main():
     ckpt_save_freq = config.train.save_freq // args.n_envs
     eval_freq = config.train.eval_freq // args.n_envs
 
-    checkpoint_cb = CheckpointCallback(
+    checkpoint_cb = TaggedCheckpointCallback(
         save_freq=ckpt_save_freq,
         save_path=str(config.paths.checkpoint_dir),
         name_prefix="mario_ppo",
@@ -374,7 +508,7 @@ def main():
     callbacks.append(checkpoint_cb)
     print(f"Checkpoint 保存频率: 每 {config.train.save_freq:,} 总步（实际 callback freq={ckpt_save_freq}）")
 
-    eval_cb = EvalCallback(
+    eval_cb = TaggedEvalCallback(
         eval_env,
         best_model_save_path=str(config.paths.checkpoint_dir / "best"),
         log_path=str(config.paths.log_dir),
@@ -407,11 +541,11 @@ def main():
         callbacks.append(adaptive_ent_cb)
         print(f"自适应熵系数已启用（目标熵={args.target_entropy}，范围±{args.entropy_band}，ent_coef 范围 0.01~0.1）")
 
-    # 6. 训练（log_interval=1：每次 PPO 更新都打印详细指标）
+    # 6. 训练（log_interval：每N次PPO更新打印详细指标，默认10；进度条已含关键指标）
     model.learn(
         total_timesteps=config.train.total_timesteps,
         callback=callbacks,
-        log_interval=1,
+        log_interval=args.log_interval,
     )
 
     # 7. 保存最终模型 + VecNormalize 统计信息

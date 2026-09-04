@@ -145,6 +145,80 @@ class RewardShaping(gym.RewardWrapper):
         return reward
 
 
+class RandomLevelEnv(gym.Env):
+    """随机关卡环境：每次 reset 时随机选择一个关卡，强制模型学通用策略而非记忆单关布局。
+
+    原理：内部维护当前环境实例，每次 reset 时随机选 world/stage 并重建环境。
+    所有 step/render/seed/close 调用转发到当前环境。
+    适用于多关卡联合训练，提升模型泛化能力。
+    """
+
+    metadata = {"render.modes": ["human", "rgb_array"]}
+
+    def __init__(self, worlds=(1,), stages=(1, 2, 3, 4), levels=None, seed: int = None):
+        """
+        Args:
+            worlds: 可选的 world 列表，如 (1, 2) 表示 1-1~2-4（与 stages 笛卡尔积）
+            stages: 可选的 stage 列表，如 (1,2,3,4)
+            levels: 直接指定关卡列表，如 ((1,1), (1,2), (2,4))。优先级高于 worlds/stages。
+                    用于灵活指定训练集/测试集分离，如7关训练+1关测试。
+            seed: 随机关卡选择的随机种子
+        """
+        self.worlds = tuple(worlds)
+        self.stages = tuple(stages)
+        if levels is not None:
+            self.levels = tuple(tuple(lv) for lv in levels)
+        else:
+            self.levels = tuple((w, s) for w in worlds for s in stages)
+        self._rng = np.random.RandomState(seed)
+        self.current_env = None
+        self.current_world = None
+        self.current_stage = None
+        self.observation_space = None
+        self.action_space = None
+        self._make_env()
+
+    def _make_env(self):
+        """随机选一个关卡并创建原始环境 + JoypadSpace 包装。"""
+        idx = self._rng.randint(len(self.levels))
+        self.current_world, self.current_stage = self.levels[idx]
+        env_id = f"SuperMarioBros-{self.current_world}-{self.current_stage}-v0"
+        if self.current_env is not None:
+            try:
+                self.current_env.close()
+            except Exception:
+                pass
+        raw_env = gym_super_mario_bros.make(env_id)
+        self.current_env = JoypadSpace(raw_env, SIMPLE_MOVEMENT)
+        self.observation_space = self.current_env.observation_space
+        self.action_space = self.current_env.action_space
+
+    def reset(self):
+        """每次 reset 都随机选新关卡并重建环境。"""
+        self._make_env()
+        return self.current_env.reset()
+
+    def step(self, action):
+        return self.current_env.step(action)
+
+    def render(self, mode="human"):
+        return self.current_env.render(mode)
+
+    def seed(self, seed=None):
+        self._rng = np.random.RandomState(seed)
+        return self.current_env.seed(seed)
+
+    def close(self):
+        if self.current_env is not None:
+            try:
+                self.current_env.close()
+            except Exception:
+                pass
+
+    def __str__(self):
+        return f"RandomLevelEnv(current={self.current_world}-{self.current_stage}, worlds={self.worlds}, stages={self.stages})"
+
+
 def make_env(
     env_id: str = None,
     seed: int = None,
@@ -154,20 +228,37 @@ def make_env(
     shaping: bool = False,
     time_penalty: float = 0.0,
     jump_penalty: float = 0.0,
+    world: int = None,
+    stage: int = None,
+    multi_level: bool = False,
+    multi_worlds: tuple = (1,),
+    multi_stages: tuple = (1, 2, 3, 4),
+    levels: tuple = None,
 ):
     """创建并组装完整的马里奥环境 Wrapper 管线。
-    参数为 None 时使用 config 中的默认值。"""
+    参数为 None 时使用 config 中的默认值。
+    world/stage 指定单关卡（优先级高于 env_id）。
+    multi_level=True 时开启随机关卡模式，每次 reset 随机选关卡，强制模型学通用策略。
+    levels 直接指定关卡列表（如 ((1,1),(1,2),(2,4))），优先级高于 multi_worlds/multi_stages。"""
     cfg = config.env
-    env_id = env_id or cfg.env_id
     seed = seed if seed is not None else cfg.seed
     frame_skip = frame_skip if frame_skip is not None else cfg.frame_skip
     stack_size = stack_size if stack_size is not None else cfg.stack_size
     image_size = image_size if image_size is not None else cfg.image_size
 
     # 1. 创建原始环境 + 动作空间压缩（SIMPLE_MOVEMENT 7 动作）
-    env = gym_super_mario_bros.make(env_id)
-    env = JoypadSpace(env, SIMPLE_MOVEMENT)
-    env.seed(seed)
+    if multi_level:
+        # 多关卡模式：RandomLevelEnv 内部已包含 JoypadSpace，每次 reset 随机选关卡
+        env = RandomLevelEnv(worlds=multi_worlds, stages=multi_stages, levels=levels, seed=seed)
+    else:
+        # 单关卡模式
+        if world is not None and stage is not None:
+            env_id = f"SuperMarioBros-{world}-{stage}-v0"
+        else:
+            env_id = env_id or cfg.env_id
+        env = gym_super_mario_bros.make(env_id)
+        env = JoypadSpace(env, SIMPLE_MOVEMENT)
+        env.seed(seed)
 
     # 2. 帧跳过
     env = SkipFrame(env, skip=frame_skip)
